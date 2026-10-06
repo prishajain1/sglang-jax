@@ -17,22 +17,26 @@ def get_slot_mapping(
     new_kv_start_loc: jax.Array,
     slice_lens: jax.Array,
 ):
-    slot_mapping = jnp.stack([kv_cache_start_loc, new_kv_start_loc, slice_lens], axis=1)
+    # Stack directly in [3, num_slices] layout to avoid a 2D TensorCore transpose.
+    slot_mapping = jnp.stack(
+        [kv_cache_start_loc, new_kv_start_loc, slice_lens], axis=0
+    ).astype(jnp.int32)
+    num_slices = slot_mapping.shape[1]
     padded_size = (
-        (slot_mapping.shape[0] + num_slices_per_block - 1)
+        (num_slices + num_slices_per_block - 1)
         // num_slices_per_block
         * num_slices_per_block
     )
-    slot_mapping = jnp.pad(
-        slot_mapping,
-        [[0, padded_size - slot_mapping.shape[0]], [0, 0]],
-        constant_values=0,
-    )
-    slot_mapping = jnp.transpose(slot_mapping)
-    return slot_mapping.astype(jnp.int32)
+    if padded_size > num_slices:
+        slot_mapping = jnp.pad(
+            slot_mapping,
+            [[0, 0], [0, padded_size - num_slices]],
+            constant_values=0,
+        )
+    return slot_mapping
 
 
-VMEM_SIZE = 64 * 1024 * 1024  # 32MB
+VMEM_SIZE = 64 * 1024 * 1024  # 64MB
 
 
 def get_num_slices_per_block(new_kv: jax.Array, kv_cache: jax.Array, page_size=128):
@@ -81,40 +85,179 @@ def kv_cache_update_kernel(
     # head_dim]
     sem,
 ):
-    async_copies = []
     block_idx = pl.program_id(0)
     num_slices_per_block = scratch.shape[0]
-    # Copy from new_kv_hbm_ref to scratch
+    total_cache_slots = kv_cache_hbm_ref.shape[0]
+
+    # Phase 1: Copy valid slices from new_kv_hbm_ref to scratch VMEM
     for i in range(num_slices_per_block):
         offset_i = i + block_idx * num_slices_per_block
+        kv_cache_start = slices_ref[0, offset_i]
         new_kv_start = slices_ref[1, offset_i]
         length = slices_ref[2, offset_i]
-        async_copy = pltpu.make_async_copy(
-            new_kv_hbm_ref.at[pl.ds(new_kv_start, length), ...],
-            scratch.at[jnp.uint32(i), pl.ds(0, length), ...],
-            sem,
-        )
-        async_copy.start()
-        async_copies.append(async_copy)
+        valid = (length > 0) & (kv_cache_start >= 0) & (kv_cache_start + length <= total_cache_slots)
 
-    for async_copy in async_copies:
-        async_copy.wait()
+        @pl.when(valid)
+        def _start_read(i=i, new_kv_start=new_kv_start, length=length):
+            pltpu.make_async_copy(
+                new_kv_hbm_ref.at[pl.ds(new_kv_start, length), ...],
+                scratch.at[jnp.uint32(i), pl.ds(0, length), ...],
+                sem,
+            ).start()
 
-    # Copy from scratch to kv_cache_hbm_ref
-    async_copies.clear()
+    for i in range(num_slices_per_block):
+        offset_i = i + block_idx * num_slices_per_block
+        kv_cache_start = slices_ref[0, offset_i]
+        new_kv_start = slices_ref[1, offset_i]
+        length = slices_ref[2, offset_i]
+        valid = (length > 0) & (kv_cache_start >= 0) & (kv_cache_start + length <= total_cache_slots)
+
+        @pl.when(valid)
+        def _wait_read(i=i, new_kv_start=new_kv_start, length=length):
+            pltpu.make_async_copy(
+                new_kv_hbm_ref.at[pl.ds(new_kv_start, length), ...],
+                scratch.at[jnp.uint32(i), pl.ds(0, length), ...],
+                sem,
+            ).wait()
+
+    # Phase 2: Scatter valid slices from scratch VMEM to kv_cache_hbm_ref
     for i in range(num_slices_per_block):
         offset_i = i + block_idx * num_slices_per_block
         kv_cache_start = slices_ref[0, offset_i]
         length = slices_ref[2, offset_i]
-        async_copy = pltpu.make_async_copy(
-            scratch.at[jnp.uint32(i), pl.ds(0, length), ...],
-            kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
-            sem,
-        )
-        async_copy.start()
-        async_copies.append(async_copy)
-    for async_copy in async_copies:
-        async_copy.wait()
+        valid = (length > 0) & (kv_cache_start >= 0) & (kv_cache_start + length <= total_cache_slots)
+
+        @pl.when(valid)
+        def _start_write(i=i, kv_cache_start=kv_cache_start, length=length):
+            pltpu.make_async_copy(
+                scratch.at[jnp.uint32(i), pl.ds(0, length), ...],
+                kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
+                sem,
+            ).start()
+
+    for i in range(num_slices_per_block):
+        offset_i = i + block_idx * num_slices_per_block
+        kv_cache_start = slices_ref[0, offset_i]
+        length = slices_ref[2, offset_i]
+        valid = (length > 0) & (kv_cache_start >= 0) & (kv_cache_start + length <= total_cache_slots)
+
+        @pl.when(valid)
+        def _wait_write(i=i, kv_cache_start=kv_cache_start, length=length):
+            pltpu.make_async_copy(
+                scratch.at[jnp.uint32(i), pl.ds(0, length), ...],
+                kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
+                sem,
+            ).wait()
+
+
+def _kv_cache_update_slots_kernel(
+    slots_ref,  # [padded_num_tokens] in SMEM
+    new_kv_block_ref,  # [num_slices_per_block, num_combined_kv_heads, head_dim] in VMEM
+    kv_cache_hbm_ref,  # [total_slots, num_combined_kv_heads, head_dim] in HBM
+    _,  # aliased output in HBM
+    sem,
+):
+    """Fast-path 1D-slot kernel: contiguous BlockSpec read of new_kv + predicated async DMA scatter."""
+    block_idx = pl.program_id(0)
+    num_slices_per_block = new_kv_block_ref.shape[0]
+    total_cache_slots = kv_cache_hbm_ref.shape[0]
+
+    for i in range(num_slices_per_block):
+        offset_i = i + block_idx * num_slices_per_block
+        slot = slots_ref[offset_i]
+        valid = (slot >= 0) & (slot < total_cache_slots)
+
+        @pl.when(valid)
+        def _start_write(i=i, slot=slot):
+            pltpu.make_async_copy(
+                new_kv_block_ref.at[pl.ds(i, 1), ...],
+                kv_cache_hbm_ref.at[pl.ds(slot, 1), ...],
+                sem,
+            ).start()
+
+    for i in range(num_slices_per_block):
+        offset_i = i + block_idx * num_slices_per_block
+        slot = slots_ref[offset_i]
+        valid = (slot >= 0) & (slot < total_cache_slots)
+
+        @pl.when(valid)
+        def _wait_write(i=i, slot=slot):
+            pltpu.make_async_copy(
+                new_kv_block_ref.at[pl.ds(i, 1), ...],
+                kv_cache_hbm_ref.at[pl.ds(slot, 1), ...],
+                sem,
+            ).wait()
+
+
+def kv_cache_update_slots(
+    new_kv: jax.Array,
+    slots: jax.Array,
+    kv_cache: jax.Array,
+    num_slices_per_block: int = 64,
+) -> jax.Array:
+    """Update paged KV cache from 1D token `slots` without `get_slot_mapping` or cache padding.
+
+    - For small/medium slot widths (`slot_bytes < 4096` or `cache_bytes <= 64 MiB`), dispatches
+      directly to XLA's `at[destination].set(..., mode='drop')` to avoid per-slot DMA descriptor
+      overhead and TensorCore metadata preprocessing.
+    - For large slot widths (`slot_bytes >= 4096` and `cache_bytes > 64 MiB`), uses a Pallas
+      kernel that loads contiguous `new_kv` blocks via `BlockSpec` and issues coalesced async
+      DMA writes (`num_slices_per_block=64`) directly into `kv_cache` in-place.
+    """
+    original_cache_shape = kv_cache.shape
+    total_slots = kv_cache.shape[0] * kv_cache.shape[1]
+    l = slots.shape[0]
+    row_elems = kv_cache.size // total_slots
+    bytes_per_elem = jnp.dtype(kv_cache.dtype).itemsize
+    slot_bytes = row_elems * bytes_per_elem
+    total_cache_bytes = total_slots * slot_bytes
+
+    if slot_bytes < 4096 or total_cache_bytes <= 64 * 1024 * 1024 or row_elems % 256 != 0:
+        flat_cache = kv_cache.reshape(total_slots, -1)
+        flat_update = new_kv.reshape(l, -1)
+        destination = jnp.where((slots >= 0) & (slots < total_slots), slots, total_slots)
+        updated = flat_cache.at[destination].set(flat_update, mode="drop")
+        return updated.reshape(original_cache_shape)
+
+    num_combined_kv_heads = row_elems // 128
+    head_dim = 128
+    flat_cache = kv_cache.reshape(total_slots, num_combined_kv_heads, head_dim)
+    flat_new_kv = new_kv.reshape(l, num_combined_kv_heads, head_dim)
+
+    ns = min(num_slices_per_block, l)
+    padded_l = cdiv(l, ns) * ns
+    if padded_l > l:
+        slots_padded = jnp.pad(slots, (0, padded_l - l), constant_values=-1).astype(jnp.int32)
+        flat_new_kv = jnp.pad(flat_new_kv, ((0, padded_l - l), (0, 0), (0, 0)))
+    else:
+        slots_padded = slots.astype(jnp.int32)
+
+    _any_mem = getattr(pltpu.MemorySpace, "ANY", pltpu.MemorySpace.HBM)
+    in_specs = [
+        pl.BlockSpec(
+            (ns, num_combined_kv_heads, head_dim),
+            lambda i, *_: (i, 0, 0),
+        ),
+        pl.BlockSpec(memory_space=_any_mem),
+    ]
+    out_specs = [pl.BlockSpec(memory_space=_any_mem)]
+    out_shape = [jax.ShapeDtypeStruct(flat_cache.shape, dtype=flat_cache.dtype)]
+
+    kernel = pl.pallas_call(
+        _kv_cache_update_slots_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            grid=(padded_l // ns,),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_SIZE),
+        out_shape=out_shape,
+        input_output_aliases={2: 0},
+    )
+    result = kernel(slots_padded, flat_new_kv, flat_cache)[0]
+    return result.reshape(original_cache_shape)
 
 
 def kv_cache_update_impl(
@@ -126,6 +269,14 @@ def kv_cache_update_impl(
     num_slices_per_block,
 ):
     """Accept 5D inputs. Flattens to 3D internally for Pallas kernel, reshapes output back to 5D."""
+    if slices.ndim == 1 and page_size == 1:
+        return kv_cache_update_slots(
+            new_kv,
+            slices,
+            kv_cache,
+            num_slices_per_block=num_slices_per_block,
+        )
+
     assert new_kv.ndim == 5, f"new_kv must be 5D, got {new_kv.ndim}D: {new_kv.shape}"
     assert kv_cache.ndim == 5, f"kv_cache must be 5D, got {kv_cache.ndim}D: {kv_cache.shape}"
     assert (
@@ -173,13 +324,24 @@ def kv_cache_update_impl(
         pltpu.SemaphoreType.DMA,
     ]
 
+    num_slices_int = (
+        int(num_kv_update_slices[0])
+        if not isinstance(num_kv_update_slices, int)
+        and not isinstance(num_kv_update_slices[0], jax.Tracer)
+        else (
+            num_kv_update_slices
+            if isinstance(num_kv_update_slices, int)
+            else slices.shape[1]
+        )
+    )
+
     kernel = pl.pallas_call(
         kv_cache_update_kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalar_prefetches),
             in_specs=in_specs,
             out_specs=out_specs,
-            grid=(cdiv(num_kv_update_slices[0], num_slices_per_block),),
+            grid=(cdiv(num_slices_int, num_slices_per_block),),
             scratch_shapes=scratch_shapes,
         ),
         compiler_params=pltpu.CompilerParams(
